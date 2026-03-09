@@ -86,7 +86,7 @@ def patch_deco_wlan_response(router: Any, logger: Logger) -> None:
             decoded_response = _decode_response(self, raw_response, logger)
             if decoded_response is None:
                 if is_wlan_write:
-                    if _verify_wlan_write_applied(original_request, path, data, logger):
+                    if _verify_wlan_write_applied(self, original_request, path, data, logger):
                         return None
                     error = (
                         "TplinkRouter - {} - WLAN write was sent but no state change was observed; "
@@ -107,7 +107,7 @@ def patch_deco_wlan_response(router: Any, logger: Logger) -> None:
             if ignore_errors:
                 return decoded_response
             if is_wlan_write and not _contains_explicit_error(decoded_response):
-                if _verify_wlan_write_applied(original_request, path, data, logger):
+                if _verify_wlan_write_applied(self, original_request, path, data, logger):
                     return None
                 error = (
                     "TplinkRouter - {} - WLAN write returned unexpected schema and no state change was observed; "
@@ -149,6 +149,7 @@ def _is_wlan_write_request(payload: str) -> bool:
 
 
 def _verify_wlan_write_applied(
+    router: TPLinkDecoClient,
     original_request: Any,
     path: str,
     payload: str,
@@ -161,11 +162,11 @@ def _verify_wlan_write_applied(
 
     # Some Deco firmwares return non-JSON payloads for write calls.
     # Verify state with a read call instead of trusting write response format.
-    if _poll_wlan_state_matches(original_request, targets, logger):
+    if _poll_wlan_state_matches(router, original_request, targets, logger):
         logger.debug("TplinkRouter deco compat - WLAN write verified after initial write")
         return True
 
-    state = _read_wlan_state(original_request, logger)
+    state = _read_wlan_state(router, original_request, logger)
     for retry_path, retry_payload in _build_wlan_retry_requests(path, payload, state, targets, logger):
         if retry_path == path and retry_payload == payload:
             continue
@@ -175,7 +176,8 @@ def _verify_wlan_write_applied(
             retry_payload,
         )
         try:
-            original_request(retry_path, retry_payload, False, False)
+            # Ignore response parsing on retries and rely on explicit state verification.
+            original_request(retry_path, retry_payload, True, False)
         except Exception as err:
             logger.debug(
                 "TplinkRouter deco compat - WLAN write retry failed: %s",
@@ -187,7 +189,7 @@ def _verify_wlan_write_applied(
                 # Abort retries gracefully and let caller handle the original write error.
                 return False
 
-        if _poll_wlan_state_matches(original_request, targets, logger):
+        if _poll_wlan_state_matches(router, original_request, targets, logger):
             logger.debug("TplinkRouter deco compat - WLAN write verified after retry payload")
             return True
 
@@ -374,23 +376,53 @@ def _guest_only_targets(targets: list[tuple[tuple[str, str, str], bool]]) -> boo
     return bool(targets) and all(target[0][1] == "guest" for target in targets)
 
 
-def _poll_wlan_state_matches(original_request: Any, targets: list[tuple[tuple[str, str, str], bool]],
-                             logger: Logger, attempts: int = 3) -> bool:
+def _poll_wlan_state_matches(router: TPLinkDecoClient, original_request: Any,
+                             targets: list[tuple[tuple[str, str, str], bool]], logger: Logger,
+                             attempts: int = 6) -> bool:
     for attempt in range(1, attempts + 1):
-        state = _read_wlan_state(original_request, logger)
+        state = _read_wlan_state(router, original_request, logger)
         if state is not None and _wlan_state_matches(state, targets):
             return True
         if attempt < attempts:
-            sleep(0.35)
+            sleep(0.5)
     return False
 
 
-def _read_wlan_state(original_request: Any, logger: Logger) -> dict | None:
+def _read_wlan_state(router: TPLinkDecoClient, original_request: Any, logger: Logger) -> dict | None:
     try:
         data = original_request(_WLAN_ENDPOINT, dumps({"operation": "read"}), False, False)
         if isinstance(data, dict):
             logger.debug("TplinkRouter deco compat - WLAN state read for verification: %s", data)
             return data
+    except ClientError as err:
+        if "An unknown response" not in str(err):
+            logger.debug(
+                "TplinkRouter deco compat - failed to read WLAN state for verification: %s",
+                err,
+                exc_info=True,
+            )
+            return None
+
+        raw_response = _extract_raw_response(str(err))
+        if raw_response:
+            decoded_response = _decode_response(router, raw_response, logger)
+            if isinstance(decoded_response, dict):
+                if router._is_valid_response(decoded_response):
+                    data = decoded_response.get(router._data_block)
+                    if isinstance(data, dict):
+                        logger.debug(
+                            "TplinkRouter deco compat - WLAN state read decoded for verification: %s",
+                            data,
+                        )
+                        return data
+                elif decoded_response:
+                    # Some firmwares return data block directly without wrapper keys.
+                    if _looks_like_wlan_state(decoded_response):
+                        logger.debug(
+                            "TplinkRouter deco compat - WLAN state direct decoded for verification: %s",
+                            decoded_response,
+                        )
+                        return decoded_response
     except Exception as err:
         logger.debug(
             "TplinkRouter deco compat - failed to read WLAN state for verification: %s",
@@ -410,6 +442,14 @@ def _wlan_state_matches(state: dict, targets: list[tuple[tuple[str, str, str], b
         if _to_bool(current) != desired:
             return False
     return matched > 0
+
+
+def _looks_like_wlan_state(data: dict[str, Any]) -> bool:
+    for band in ("band2_4", "band5_1", "band5_2", "band6", "band6_2"):
+        band_cfg = data.get(band)
+        if isinstance(band_cfg, dict) and ("guest" in band_cfg or "host" in band_cfg):
+            return True
+    return False
 
 
 def _build_wlan_retry_payloads(
@@ -519,6 +559,19 @@ def _build_wlan_retry_payloads(
                         "params": _transform_enable_values(root_params, lambda b: "on" if b else "off"),
                     })
 
+            # Candidate N: keep the exact read schema and only patch target fields.
+            params_from_full_state = _apply_targets_to_state(state, targets)
+            if params_from_full_state:
+                candidates.append({"operation": "write", "params": params_from_full_state})
+                candidates.append({
+                    "operation": "write",
+                    "params": _transform_enable_values(params_from_full_state, lambda b: "on" if b else "off"),
+                })
+                candidates.append({
+                    "operation": "write",
+                    "params": _transform_enable_values(params_from_full_state, lambda b: 1 if b else 0),
+                })
+
     unique_payloads: list[str] = []
     seen: set[str] = set()
     for candidate in candidates:
@@ -540,6 +593,30 @@ def _collect_guest_bands(state: dict | None) -> list[str]:
         if isinstance(band_cfg, dict) and isinstance(band_cfg.get("guest"), dict):
             bands.append(str(band))
     return bands
+
+
+def _apply_targets_to_state(
+    state: dict | None,
+    targets: list[tuple[tuple[str, str, str], bool]],
+) -> dict[str, Any] | None:
+    if not isinstance(state, dict):
+        return None
+    params = loads(dumps(state))
+    changed = False
+    for path, desired in targets:
+        cursor: Any = params
+        for key in path[:-1]:
+            if not isinstance(cursor, dict):
+                cursor = None
+                break
+            if key not in cursor:
+                cursor = None
+                break
+            cursor = cursor[key]
+        if isinstance(cursor, dict) and path[-1] in cursor:
+            cursor[path[-1]] = desired
+            changed = True
+    return params if changed else None
 
 
 def _transform_enable_values(value: Any, transform: Any) -> Any:
