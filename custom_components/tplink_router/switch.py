@@ -18,7 +18,7 @@ from tplinkrouterc6u import Connection
 class TPLinkRouterSwitchEntityDescriptionMixin:
     method: Callable[[TPLinkRouterCoordinator, bool], Any]
     property: str
-    connection: Connection | None = None
+    connection: Connection
 
 
 @dataclass
