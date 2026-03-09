@@ -12,6 +12,7 @@ from .const import DOMAIN, DEFAULT_USER, EVENT_NEW_SMS
 import logging
 from .coordinator import TPLinkRouterCoordinator
 from homeassistant.helpers import device_registry
+from .deco_compat import patch_deco_wlan_response
 
 PLATFORMS: list[Platform] = [
     Platform.DEVICE_TRACKER,
@@ -37,6 +38,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         logger=_LOGGER,
         verify_ssl=verify_ssl
     )
+    patch_deco_wlan_response(client, _LOGGER)
 
     def callback():
         firm = client.get_firmware()
