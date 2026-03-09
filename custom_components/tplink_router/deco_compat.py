@@ -166,12 +166,16 @@ def _verify_wlan_write_applied(
         return True
 
     state = _read_wlan_state(original_request, logger)
-    for retry_payload in _build_wlan_retry_payloads(payload, state, targets, logger):
-        if retry_payload == payload:
+    for retry_path, retry_payload in _build_wlan_retry_requests(path, payload, state, targets, logger):
+        if retry_path == path and retry_payload == payload:
             continue
-        logger.debug("TplinkRouter deco compat - retrying WLAN write with payload=%s", retry_payload)
+        logger.debug(
+            "TplinkRouter deco compat - retrying WLAN write endpoint=%s payload=%s",
+            retry_path,
+            retry_payload,
+        )
         try:
-            original_request(path, retry_payload, False, False)
+            original_request(retry_path, retry_payload, False, False)
         except Exception as err:
             logger.debug(
                 "TplinkRouter deco compat - WLAN write retry failed: %s",
@@ -189,6 +193,156 @@ def _verify_wlan_write_applied(
 
     logger.debug("TplinkRouter deco compat - WLAN write verification failed, state unchanged")
     return False
+
+
+def _build_wlan_retry_requests(
+    path: str,
+    original_payload: str,
+    state: dict | None,
+    targets: list[tuple[tuple[str, str, str], bool]],
+    logger: Logger,
+) -> list[tuple[str, str]]:
+    requests: list[tuple[str, str]] = []
+
+    for payload in _build_wlan_retry_payloads(original_payload, state, targets, logger):
+        requests.append((path, payload))
+
+    if _guest_only_targets(targets):
+        for endpoint in _guest_retry_endpoints(path):
+            for params in _build_guest_retry_param_sets(state, targets):
+                requests.append((endpoint, dumps({"operation": "write", "params": params})))
+                requests.append((
+                    endpoint,
+                    dumps({"operation": "write", "params": _transform_enable_values(params, lambda b: "on" if b else "off")}),
+                ))
+                requests.append((
+                    endpoint,
+                    dumps({"operation": "write", "params": _transform_enable_values(params, lambda b: 1 if b else 0)}),
+                ))
+
+    unique_requests: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for retry_path, retry_payload in requests:
+        key = f"{retry_path}||{retry_payload}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_requests.append((retry_path, retry_payload))
+
+    logger.debug("TplinkRouter deco compat - generated %s WLAN retry requests", len(unique_requests))
+    return unique_requests
+
+
+def _guest_retry_endpoints(default_path: str) -> list[str]:
+    return [
+        default_path,
+        "admin/wireless?form=guest_network",
+        "admin/wireless?form=guest",
+        "admin/wireless?form=wlan_guest",
+    ]
+
+
+def _build_guest_retry_param_sets(
+    state: dict | None,
+    targets: list[tuple[tuple[str, str, str], bool]],
+) -> list[dict[str, Any]]:
+    guest_profile = _build_guest_profile(state, targets)
+    if not guest_profile:
+        return []
+
+    host_profile = _build_host_profile(state)
+    ext_guest_profile = _build_ext_guest_profile(state, guest_profile)
+
+    params_sets: list[dict[str, Any]] = [
+        {"guest": dict(guest_profile)},
+        {"guest_network": dict(guest_profile)},
+        {"guestNetwork": dict(guest_profile)},
+    ]
+
+    if ext_guest_profile:
+        params_sets.append({"ext_guest": dict(ext_guest_profile)})
+        params_sets.append({"guest": dict(guest_profile), "ext_guest": dict(ext_guest_profile)})
+
+    if host_profile:
+        params_sets.append({"host": dict(host_profile), "guest": dict(guest_profile)})
+        params_sets.append({"hostNetwork": dict(host_profile), "guestNetwork": dict(guest_profile)})
+
+    return params_sets
+
+
+def _build_guest_profile(
+    state: dict | None,
+    targets: list[tuple[tuple[str, str, str], bool]],
+) -> dict[str, Any]:
+    band_to_enable_key = {
+        "band2_4": "enable_2g",
+        "band5_1": "enable_5g",
+        "band5_2": "enable_5g2",
+        "band6": "enable_6g",
+        "band6_2": "enable_6g2",
+    }
+
+    profile: dict[str, Any] = {}
+    if isinstance(state, dict):
+        for band, enable_key in band_to_enable_key.items():
+            current = _get_nested(state, [band, "guest", "enable"])
+            if current is not None:
+                profile[enable_key] = _to_bool(current)
+
+        for key in ("guest", "guest_network", "guestNetwork"):
+            value = state.get(key)
+            if not isinstance(value, dict):
+                continue
+            for extra in (
+                "ssid",
+                "password",
+                "enable_wpa3",
+                "host_isolation",
+                "bw_limit_enable",
+                "enable",
+                "guest_enable_6g2",
+            ):
+                if extra in value and extra not in profile:
+                    profile[extra] = value[extra]
+
+        if "host_isolation" in state and "host_isolation" not in profile:
+            profile["host_isolation"] = state["host_isolation"]
+
+    for target_path, desired in targets:
+        band = target_path[0]
+        enable_key = band_to_enable_key.get(band)
+        if enable_key:
+            profile[enable_key] = desired
+
+    return profile
+
+
+def _build_host_profile(state: dict | None) -> dict[str, Any]:
+    band_to_enable_key = {
+        "band2_4": "enable_2g",
+        "band5_1": "enable_5g",
+        "band5_2": "enable_5g2",
+        "band6": "enable_6g",
+        "band6_2": "enable_6g2",
+    }
+    profile: dict[str, Any] = {}
+    if not isinstance(state, dict):
+        return profile
+
+    for band, enable_key in band_to_enable_key.items():
+        current = _get_nested(state, [band, "host", "enable"])
+        if current is not None:
+            profile[enable_key] = _to_bool(current)
+    return profile
+
+
+def _build_ext_guest_profile(state: dict | None, guest_profile: dict[str, Any]) -> dict[str, Any]:
+    profile: dict[str, Any] = {}
+    if "enable_6g2" in guest_profile:
+        profile["enable_6g2"] = guest_profile["enable_6g2"]
+    if isinstance(state, dict) and "guest_enable_6g2" in state:
+        profile["enable_6g2"] = state["guest_enable_6g2"]
+    return profile
 
 
 def _extract_wlan_targets(payload: str) -> list[tuple[tuple[str, str, str], bool]]:
@@ -392,7 +546,7 @@ def _transform_enable_values(value: Any, transform: Any) -> Any:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         for key, item in value.items():
-            if key == "enable":
+            if key == "enable" or str(key).startswith("enable_") or key == "guest_enable_6g2":
                 result[key] = transform(_to_bool(item))
             else:
                 result[key] = _transform_enable_values(item, transform)
