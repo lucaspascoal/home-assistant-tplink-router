@@ -74,7 +74,7 @@ def patch_deco_wlan_response(router: Any, logger: Logger) -> None:
             decoded_response = _decode_response(self, raw_response, logger)
             if decoded_response is None:
                 if is_wlan_write:
-                    if _verify_wlan_write_applied(self, original_request, path, data, logger):
+                    if _verify_wlan_write_applied(original_request, path, data, logger):
                         return None
                     error = (
                         "TplinkRouter - {} - WLAN write was sent but no state change was observed; "
@@ -95,7 +95,7 @@ def patch_deco_wlan_response(router: Any, logger: Logger) -> None:
             if ignore_errors:
                 return decoded_response
             if is_wlan_write and not _contains_explicit_error(decoded_response):
-                if _verify_wlan_write_applied(self, original_request, path, data, logger):
+                if _verify_wlan_write_applied(original_request, path, data, logger):
                     return None
                 error = (
                     "TplinkRouter - {} - WLAN write returned unexpected schema and no state change was observed; "
@@ -137,7 +137,6 @@ def _is_wlan_write_request(payload: str) -> bool:
 
 
 def _verify_wlan_write_applied(
-    router: TPLinkDecoClient,
     original_request: Any,
     path: str,
     payload: str,
@@ -150,29 +149,27 @@ def _verify_wlan_write_applied(
 
     # Some Deco firmwares return non-JSON payloads for write calls.
     # Verify state with a read call instead of trusting write response format.
-    if _poll_wlan_state_matches(router, original_request, targets, logger):
+    if _poll_wlan_state_matches(original_request, targets, logger):
         logger.debug("TplinkRouter deco compat - WLAN write verified after initial write")
         return True
 
-    if _guest_only_targets(targets):
-        expanded_payload = _build_all_guest_bands_payload(router, original_request, targets[0][1], logger)
-        if expanded_payload and expanded_payload != payload:
+    state = _read_wlan_state(original_request, logger)
+    for retry_payload in _build_wlan_retry_payloads(payload, state, targets, logger):
+        if retry_payload == payload:
+            continue
+        logger.debug("TplinkRouter deco compat - retrying WLAN write with payload=%s", retry_payload)
+        try:
+            original_request(path, retry_payload, False, False)
+        except ClientError as err:
             logger.debug(
-                "TplinkRouter deco compat - retrying WLAN write with guest-all-bands payload=%s",
-                expanded_payload,
+                "TplinkRouter deco compat - WLAN write retry returned parse error: %s",
+                err,
+                exc_info=True,
             )
-            try:
-                original_request(path, expanded_payload, False, False)
-            except ClientError as err:
-                logger.debug(
-                    "TplinkRouter deco compat - guest-all-bands retry returned parse error: %s",
-                    err,
-                    exc_info=True,
-                )
 
-            if _poll_wlan_state_matches(router, original_request, targets, logger):
-                logger.debug("TplinkRouter deco compat - WLAN write verified after guest-all-bands retry")
-                return True
+        if _poll_wlan_state_matches(original_request, targets, logger):
+            logger.debug("TplinkRouter deco compat - WLAN write verified after retry payload")
+            return True
 
     logger.debug("TplinkRouter deco compat - WLAN write verification failed, state unchanged")
     return False
@@ -207,13 +204,8 @@ def _guest_only_targets(targets: list[tuple[tuple[str, str, str], bool]]) -> boo
     return bool(targets) and all(target[0][1] == "guest" for target in targets)
 
 
-def _poll_wlan_state_matches(
-    router: TPLinkDecoClient,
-    original_request: Any,
-    targets: list[tuple[tuple[str, str, str], bool]],
-    logger: Logger,
-    attempts: int = 3,
-) -> bool:
+def _poll_wlan_state_matches(original_request: Any, targets: list[tuple[tuple[str, str, str], bool]],
+                             logger: Logger, attempts: int = 3) -> bool:
     for attempt in range(1, attempts + 1):
         state = _read_wlan_state(original_request, logger)
         if state is not None and _wlan_state_matches(state, targets):
@@ -250,25 +242,115 @@ def _wlan_state_matches(state: dict, targets: list[tuple[tuple[str, str, str], b
     return matched > 0
 
 
-def _build_all_guest_bands_payload(
-    router: TPLinkDecoClient,
-    original_request: Any,
-    enable: bool,
+def _build_wlan_retry_payloads(
+    original_payload: str,
+    state: dict | None,
+    targets: list[tuple[tuple[str, str, str], bool]],
     logger: Logger,
-) -> str | None:
-    state = _read_wlan_state(original_request, logger)
+) -> list[str]:
+    try:
+        body = loads(original_payload)
+    except Exception:
+        return []
+    if body.get("operation") != "write":
+        return []
+
+    params = body.get("params")
+    if not isinstance(params, dict):
+        return []
+
+    candidates: list[dict] = []
+
+    # Candidate 1: same shape, but with string on/off values.
+    candidates.append({"operation": "write", "params": _transform_enable_values(params, lambda b: "on" if b else "off")})
+
+    # Candidate 2: same shape, but with 1/0 values.
+    candidates.append({"operation": "write", "params": _transform_enable_values(params, lambda b: 1 if b else 0)})
+
+    if _guest_only_targets(targets):
+        desired = targets[0][1]
+        guest_bands = _collect_guest_bands(state)
+        if not guest_bands:
+            guest_bands = ["band2_4", "band5_1", "band6"]
+
+        params_all_bands = {band: {"guest": {"enable": desired}} for band in guest_bands}
+        candidates.append({"operation": "write", "params": params_all_bands})
+        candidates.append({
+            "operation": "write",
+            "params": _transform_enable_values(params_all_bands, lambda b: "on" if b else "off"),
+        })
+
+        # Candidate 5: full guest objects from read-state, preserving other guest fields.
+        if isinstance(state, dict):
+            params_from_state: dict[str, Any] = {}
+            for band in guest_bands:
+                band_cfg = state.get(band)
+                if not isinstance(band_cfg, dict):
+                    continue
+                guest_cfg = band_cfg.get("guest")
+                if not isinstance(guest_cfg, dict):
+                    continue
+                new_guest_cfg = dict(guest_cfg)
+                new_guest_cfg["enable"] = desired
+                params_from_state[band] = {"guest": new_guest_cfg}
+
+            if params_from_state:
+                candidates.append({"operation": "write", "params": params_from_state})
+                candidates.append({
+                    "operation": "write",
+                    "params": _transform_enable_values(params_from_state, lambda b: "on" if b else "off"),
+                })
+
+            # Candidate 6+: if read-state has root guest controls, try those.
+            for key, value in state.items():
+                if not isinstance(value, dict):
+                    continue
+                if "guest" not in str(key).lower():
+                    continue
+                if "enable" in value:
+                    root_params = {str(key): dict(value)}
+                    root_params[str(key)]["enable"] = desired
+                    candidates.append({"operation": "write", "params": root_params})
+                    candidates.append({
+                        "operation": "write",
+                        "params": _transform_enable_values(root_params, lambda b: "on" if b else "off"),
+                    })
+
+    unique_payloads: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        payload = dumps(candidate)
+        if payload in seen:
+            continue
+        seen.add(payload)
+        unique_payloads.append(payload)
+
+    logger.debug("TplinkRouter deco compat - generated %s WLAN retry payloads", len(unique_payloads))
+    return unique_payloads
+
+
+def _collect_guest_bands(state: dict | None) -> list[str]:
+    if not isinstance(state, dict):
+        return []
     bands: list[str] = []
-    if isinstance(state, dict):
-        for band, band_cfg in state.items():
-            if isinstance(band_cfg, dict) and isinstance(band_cfg.get("guest"), dict):
-                bands.append(str(band))
+    for band, band_cfg in state.items():
+        if isinstance(band_cfg, dict) and isinstance(band_cfg.get("guest"), dict):
+            bands.append(str(band))
+    return bands
 
-    if not bands:
-        # Fallback bands used by existing Deco implementation.
-        bands = ["band2_4", "band5_1", "band6"]
 
-    params = {band: {"guest": {"enable": enable}} for band in bands}
-    return dumps({"operation": "write", "params": params})
+def _transform_enable_values(value: Any, transform: Any) -> Any:
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "enable":
+                result[key] = transform(_to_bool(item))
+            else:
+                result[key] = _transform_enable_values(item, transform)
+        return result
+    if isinstance(value, list):
+        return [_transform_enable_values(item, transform) for item in value]
+    return value
 
 
 def _get_nested(data: dict, path: list[str]) -> Any:
