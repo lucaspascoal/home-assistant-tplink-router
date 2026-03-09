@@ -51,25 +51,37 @@ def patch_deco_wlan_response(router: Any, logger: Logger) -> None:
                 )
             return response
         except ClientError as err:
-            if not trace_wlan or "An unknown response" not in str(err):
+            unknown_response = "An unknown response" in str(err)
+            if not unknown_response:
                 raise
 
-            logger.debug(
-                "TplinkRouter deco compat - parse exception endpoint=%s payload=%s exception=%s",
-                path,
-                data,
-                err,
-                exc_info=True,
-            )
+            if trace_wlan:
+                logger.debug(
+                    "TplinkRouter deco compat - parse exception endpoint=%s payload=%s exception=%s",
+                    path,
+                    data,
+                    err,
+                    exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "TplinkRouter deco compat - parse exception endpoint=%s exception=%s",
+                    path,
+                    err,
+                    exc_info=True,
+                )
 
             raw_response = _extract_raw_response(str(err))
             if not raw_response:
                 raise
-            logger.debug(
-                "TplinkRouter deco compat - raw response endpoint=%s response=%s",
-                path,
-                raw_response,
-            )
+            if trace_wlan:
+                logger.debug(
+                    "TplinkRouter deco compat - raw response endpoint=%s response=%s",
+                    path,
+                    raw_response,
+                )
+            else:
+                logger.debug("TplinkRouter deco compat - raw response endpoint=%s", path)
 
             decoded_response = _decode_response(self, raw_response, logger)
             if decoded_response is None:
@@ -160,12 +172,16 @@ def _verify_wlan_write_applied(
         logger.debug("TplinkRouter deco compat - retrying WLAN write with payload=%s", retry_payload)
         try:
             original_request(path, retry_payload, False, False)
-        except ClientError as err:
+        except Exception as err:
             logger.debug(
-                "TplinkRouter deco compat - WLAN write retry returned parse error: %s",
+                "TplinkRouter deco compat - WLAN write retry failed: %s",
                 err,
                 exc_info=True,
             )
+            if "Not authorised" in str(err):
+                # Authorization may be invalidated by overlapping requests.
+                # Abort retries gracefully and let caller handle the original write error.
+                return False
 
         if _poll_wlan_state_matches(original_request, targets, logger):
             logger.debug("TplinkRouter deco compat - WLAN write verified after retry payload")
