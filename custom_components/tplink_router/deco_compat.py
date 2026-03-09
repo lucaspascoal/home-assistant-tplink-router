@@ -30,6 +30,7 @@ def patch_deco_wlan_response(router: Any, logger: Logger) -> None:
         ignore_errors: bool = False,
     ) -> dict | None:
         trace_wlan = path == _WLAN_ENDPOINT
+        is_wlan_write = trace_wlan and _is_wlan_write_request(data)
         if trace_wlan:
             logger.debug(
                 "TplinkRouter deco compat - endpoint=%s payload=%s ignore_response=%s ignore_errors=%s",
@@ -71,6 +72,12 @@ def patch_deco_wlan_response(router: Any, logger: Logger) -> None:
 
             decoded_response = _decode_response(self, raw_response, logger)
             if decoded_response is None:
+                if is_wlan_write:
+                    logger.warning(
+                        "TplinkRouter deco compat - non-JSON WLAN write response received; "
+                        "treating response as success for Deco firmware compatibility."
+                    )
+                    return None
                 raise
             logger.debug(
                 "TplinkRouter deco compat - decoded response endpoint=%s response=%s",
@@ -82,6 +89,12 @@ def patch_deco_wlan_response(router: Any, logger: Logger) -> None:
                 return decoded_response.get(self._data_block)
             if ignore_errors:
                 return decoded_response
+            if is_wlan_write and not _contains_explicit_error(decoded_response):
+                logger.warning(
+                    "TplinkRouter deco compat - decoded WLAN write response has unexpected schema; "
+                    "treating response as success for Deco firmware compatibility."
+                )
+                return None
 
             error = (
                 "TplinkRouter - {} - Response with error; Request {} - Response {}"
@@ -104,6 +117,25 @@ def _extract_raw_response(error_message: str) -> str | None:
     if marker not in error_message:
         return None
     return error_message.split(marker, 1)[1].strip()
+
+
+def _is_wlan_write_request(payload: str) -> bool:
+    try:
+        body = loads(payload)
+        return body.get("operation") == "write"
+    except Exception:
+        return False
+
+
+def _contains_explicit_error(decoded_response: dict) -> bool:
+    if "error_code" in decoded_response and decoded_response["error_code"] != 0:
+        return True
+    if "success" in decoded_response and not decoded_response["success"]:
+        return True
+    result = decoded_response.get("result")
+    if isinstance(result, dict) and "error_code" in result and result["error_code"] != 0:
+        return True
+    return False
 
 
 def _decode_response(router: TPLinkDecoClient, raw_response: str, logger: Logger) -> dict | None:
