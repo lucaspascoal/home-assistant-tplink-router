@@ -147,14 +147,10 @@ class TPLinkRouterSwitchEntity(
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on."""
         await self.entity_description.method(self.coordinator, True)
-        setattr(self.coordinator.status, self.entity_description.property, True)
-        self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
         await self.entity_description.method(self.coordinator, False)
-        setattr(self.coordinator.status, self.entity_description.property, False)
-        self.async_write_ha_state()
 
 
 class TPLinkRouterScanEntity(

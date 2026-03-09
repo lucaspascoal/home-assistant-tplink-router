@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from base64 import b64decode
-from json import loads
+from json import dumps, loads
 from logging import Logger
+from time import sleep
 from types import MethodType
 from typing import Any
 
@@ -73,11 +74,15 @@ def patch_deco_wlan_response(router: Any, logger: Logger) -> None:
             decoded_response = _decode_response(self, raw_response, logger)
             if decoded_response is None:
                 if is_wlan_write:
-                    logger.warning(
-                        "TplinkRouter deco compat - non-JSON WLAN write response received; "
-                        "treating response as success for Deco firmware compatibility."
+                    if _verify_wlan_write_applied(self, original_request, path, data, logger):
+                        return None
+                    error = (
+                        "TplinkRouter - {} - WLAN write was sent but no state change was observed; "
+                        "response could not be decoded. Request {} - Response {}"
+                        .format(self.__class__.__name__, path, raw_response)
                     )
-                    return None
+                    logger.warning(error)
+                    raise ClientError(error) from err
                 raise
             logger.debug(
                 "TplinkRouter deco compat - decoded response endpoint=%s response=%s",
@@ -90,11 +95,15 @@ def patch_deco_wlan_response(router: Any, logger: Logger) -> None:
             if ignore_errors:
                 return decoded_response
             if is_wlan_write and not _contains_explicit_error(decoded_response):
-                logger.warning(
-                    "TplinkRouter deco compat - decoded WLAN write response has unexpected schema; "
-                    "treating response as success for Deco firmware compatibility."
+                if _verify_wlan_write_applied(self, original_request, path, data, logger):
+                    return None
+                error = (
+                    "TplinkRouter - {} - WLAN write returned unexpected schema and no state change was observed; "
+                    "Request {} - Response {}"
+                    .format(self.__class__.__name__, path, decoded_response)
                 )
-                return None
+                logger.warning(error)
+                raise ClientError(error) from err
 
             error = (
                 "TplinkRouter - {} - Response with error; Request {} - Response {}"
@@ -125,6 +134,158 @@ def _is_wlan_write_request(payload: str) -> bool:
         return body.get("operation") == "write"
     except Exception:
         return False
+
+
+def _verify_wlan_write_applied(
+    router: TPLinkDecoClient,
+    original_request: Any,
+    path: str,
+    payload: str,
+    logger: Logger,
+) -> bool:
+    targets = _extract_wlan_targets(payload)
+    if not targets:
+        logger.debug("TplinkRouter deco compat - cannot verify WLAN write: no target fields in payload")
+        return False
+
+    # Some Deco firmwares return non-JSON payloads for write calls.
+    # Verify state with a read call instead of trusting write response format.
+    if _poll_wlan_state_matches(router, original_request, targets, logger):
+        logger.debug("TplinkRouter deco compat - WLAN write verified after initial write")
+        return True
+
+    if _guest_only_targets(targets):
+        expanded_payload = _build_all_guest_bands_payload(router, original_request, targets[0][1], logger)
+        if expanded_payload and expanded_payload != payload:
+            logger.debug(
+                "TplinkRouter deco compat - retrying WLAN write with guest-all-bands payload=%s",
+                expanded_payload,
+            )
+            try:
+                original_request(path, expanded_payload, False, False)
+            except ClientError as err:
+                logger.debug(
+                    "TplinkRouter deco compat - guest-all-bands retry returned parse error: %s",
+                    err,
+                    exc_info=True,
+                )
+
+            if _poll_wlan_state_matches(router, original_request, targets, logger):
+                logger.debug("TplinkRouter deco compat - WLAN write verified after guest-all-bands retry")
+                return True
+
+    logger.debug("TplinkRouter deco compat - WLAN write verification failed, state unchanged")
+    return False
+
+
+def _extract_wlan_targets(payload: str) -> list[tuple[tuple[str, str, str], bool]]:
+    try:
+        body = loads(payload)
+    except Exception:
+        return []
+
+    if body.get("operation") != "write":
+        return []
+
+    params = body.get("params")
+    if not isinstance(params, dict):
+        return []
+
+    targets: list[tuple[tuple[str, str, str], bool]] = []
+    for band, band_cfg in params.items():
+        if not isinstance(band_cfg, dict):
+            continue
+        for net in ("guest", "host", "iot"):
+            net_cfg = band_cfg.get(net)
+            if not isinstance(net_cfg, dict) or "enable" not in net_cfg:
+                continue
+            targets.append(((str(band), net, "enable"), _to_bool(net_cfg.get("enable"))))
+    return targets
+
+
+def _guest_only_targets(targets: list[tuple[tuple[str, str, str], bool]]) -> bool:
+    return bool(targets) and all(target[0][1] == "guest" for target in targets)
+
+
+def _poll_wlan_state_matches(
+    router: TPLinkDecoClient,
+    original_request: Any,
+    targets: list[tuple[tuple[str, str, str], bool]],
+    logger: Logger,
+    attempts: int = 3,
+) -> bool:
+    for attempt in range(1, attempts + 1):
+        state = _read_wlan_state(original_request, logger)
+        if state is not None and _wlan_state_matches(state, targets):
+            return True
+        if attempt < attempts:
+            sleep(0.35)
+    return False
+
+
+def _read_wlan_state(original_request: Any, logger: Logger) -> dict | None:
+    try:
+        data = original_request(_WLAN_ENDPOINT, dumps({"operation": "read"}), False, False)
+        if isinstance(data, dict):
+            logger.debug("TplinkRouter deco compat - WLAN state read for verification: %s", data)
+            return data
+    except Exception as err:
+        logger.debug(
+            "TplinkRouter deco compat - failed to read WLAN state for verification: %s",
+            err,
+            exc_info=True,
+        )
+    return None
+
+
+def _wlan_state_matches(state: dict, targets: list[tuple[tuple[str, str, str], bool]]) -> bool:
+    matched = 0
+    for path, desired in targets:
+        current = _get_nested(state, list(path))
+        if current is None:
+            continue
+        matched += 1
+        if _to_bool(current) != desired:
+            return False
+    return matched > 0
+
+
+def _build_all_guest_bands_payload(
+    router: TPLinkDecoClient,
+    original_request: Any,
+    enable: bool,
+    logger: Logger,
+) -> str | None:
+    state = _read_wlan_state(original_request, logger)
+    bands: list[str] = []
+    if isinstance(state, dict):
+        for band, band_cfg in state.items():
+            if isinstance(band_cfg, dict) and isinstance(band_cfg.get("guest"), dict):
+                bands.append(str(band))
+
+    if not bands:
+        # Fallback bands used by existing Deco implementation.
+        bands = ["band2_4", "band5_1", "band6"]
+
+    params = {band: {"guest": {"enable": enable}} for band in bands}
+    return dumps({"operation": "write", "params": params})
+
+
+def _get_nested(data: dict, path: list[str]) -> Any:
+    value: Any = data
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("on", "true", "1", "yes")
+    return bool(value)
 
 
 def _contains_explicit_error(decoded_response: dict) -> bool:

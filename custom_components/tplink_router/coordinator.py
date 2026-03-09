@@ -85,8 +85,10 @@ class TPLinkRouterCoordinator(DataUpdateCoordinator):
     async def set_wifi(self, wifi: Connection, enable: bool) -> None:
         def callback():
             self.router.set_wifi(wifi, enable)
+            return self.router.get_status()
 
-        await self.hass.async_add_executor_job(TPLinkRouterCoordinator.request, self.router, callback)
+        self.status = await self.hass.async_add_executor_job(TPLinkRouterCoordinator.request, self.router, callback)
+        self.async_set_updated_data(self.status)
 
     async def _async_update_data(self):
         """Asynchronous update of all data."""
