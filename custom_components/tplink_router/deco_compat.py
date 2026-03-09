@@ -258,10 +258,10 @@ def _build_wlan_retry_requests(
 
 def _guest_retry_endpoints(default_path: str) -> list[str]:
     return [
-        default_path,
         "admin/wireless?form=guest_network",
         "admin/wireless?form=guest",
         "admin/wireless?form=wlan_guest",
+        default_path,
     ]
 
 
@@ -277,11 +277,20 @@ def _build_guest_retry_param_sets(
     ext_guest_profile = _build_ext_guest_profile(state, guest_profile)
 
     guest_profile_copy = dict(guest_profile)
-    params_sets: list[dict[str, Any]] = [
+    params_sets: list[dict[str, Any]] = []
+
+    # Prioritize legacy Deco guest profile (2.4G/5G controls) first.
+    legacy_guest_profile = _build_legacy_guest_profile(guest_profile_copy, targets)
+    if legacy_guest_profile:
+        params_sets.append({"guest": dict(legacy_guest_profile)})
+        params_sets.append({"guest_network": dict(legacy_guest_profile)})
+        params_sets.append({"guestNetwork": dict(legacy_guest_profile)})
+
+    params_sets.extend([
         {"guest": dict(guest_profile_copy)},
         {"guest_network": dict(guest_profile_copy)},
         {"guestNetwork": dict(guest_profile_copy)},
-    ]
+    ])
 
     if ext_guest_profile:
         ext_guest_copy = dict(ext_guest_profile)
@@ -540,12 +549,17 @@ def _build_wlan_retry_payloads(
 
     if _guest_only_targets(targets):
         desired = targets[0][1]
+        control_bands = _collect_guest_control_bands(state)
+        params_control_bands = {band: {"guest": {"enable": desired}} for band in control_bands}
+        _append_write_candidates(candidates, params_control_bands)
+
         guest_bands = _collect_guest_bands(state)
         if not guest_bands:
             guest_bands = ["band2_4", "band5_1", "band6"]
 
         params_all_bands = {band: {"guest": {"enable": desired}} for band in guest_bands}
-        _append_write_candidates(candidates, params_all_bands)
+        if params_all_bands != params_control_bands:
+            _append_write_candidates(candidates, params_all_bands)
 
         # Candidate 5: full guest objects from read-state, preserving other guest fields.
         if isinstance(state, dict):
@@ -624,6 +638,18 @@ def _collect_guest_bands(state: dict | None) -> list[str]:
     return bands
 
 
+def _collect_guest_control_bands(state: dict | None) -> list[str]:
+    preferred = ["band2_4", "band5_1"]
+    if not isinstance(state, dict):
+        return preferred
+
+    result = [
+        band for band in preferred
+        if isinstance(state.get(band), dict) and isinstance(state.get(band, {}).get("guest"), dict)
+    ]
+    return result or preferred
+
+
 def _apply_targets_to_state(
     state: dict | None,
     targets: list[tuple[tuple[str, str, str], bool]],
@@ -694,6 +720,50 @@ def _contains_explicit_error(decoded_response: dict) -> bool:
     if isinstance(result, dict) and "error_code" in result and result["error_code"] != 0:
         return True
     return False
+
+
+def _build_legacy_guest_profile(
+    guest_profile: dict[str, Any],
+    targets: list[tuple[tuple[str, str, str], bool]],
+) -> dict[str, Any]:
+    desired_values = {desired for _, desired in targets}
+    desired = next(iter(desired_values)) if len(desired_values) == 1 else None
+
+    profile: dict[str, Any] = {}
+    for key in (
+        "enable",
+        "enable_2g",
+        "enable_5g",
+        "ssid",
+        "password",
+        "enable_wpa3",
+        "encryption",
+        "encryption_mode",
+        "enc_type",
+        "host_isolation",
+        "bw_limit_enable",
+        "bandwidth_limit",
+        "bw_limit_down",
+        "bw_limit_up",
+        "downstream_bandwidth",
+        "upstream_bandwidth",
+        "vlan_enable",
+        "vlan_id",
+        "need_set_vlan",
+        "access_duration",
+        "start_time",
+        "usr_set",
+    ):
+        if key in guest_profile:
+            profile[key] = guest_profile[key]
+
+    # For firmwares where guest is a single network switch, force 2.4/5G enables together.
+    if desired is not None:
+        profile["enable"] = desired
+        profile["enable_2g"] = desired
+        profile["enable_5g"] = desired
+
+    return profile
 
 
 def _build_enable_value_variants(params: dict[str, Any]) -> list[dict[str, Any]]:
