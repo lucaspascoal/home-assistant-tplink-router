@@ -18,6 +18,7 @@ from tplinkrouterc6u import Connection
 class TPLinkRouterSwitchEntityDescriptionMixin:
     method: Callable[[TPLinkRouterCoordinator, bool], Any]
     property: str
+    connection: Connection | None = None
 
 
 @dataclass
@@ -32,6 +33,7 @@ SWITCH_TYPES = (
         icon="mdi:wifi",
         entity_category=EntityCategory.CONFIG,
         property='guest_2g_enable',
+        connection=Connection.GUEST_2G,
         method=lambda coordinator, value: coordinator.set_wifi(Connection.GUEST_2G, value),
     ),
     TPLinkRouterSwitchEntityDescription(
@@ -40,6 +42,7 @@ SWITCH_TYPES = (
         icon="mdi:wifi",
         entity_category=EntityCategory.CONFIG,
         property='guest_5g_enable',
+        connection=Connection.GUEST_5G,
         method=lambda coordinator, value: coordinator.set_wifi(Connection.GUEST_5G, value),
     ),
     TPLinkRouterSwitchEntityDescription(
@@ -48,6 +51,7 @@ SWITCH_TYPES = (
         icon="mdi:wifi",
         entity_category=EntityCategory.CONFIG,
         property='guest_6g_enable',
+        connection=Connection.GUEST_6G,
         method=lambda coordinator, value: coordinator.set_wifi(Connection.GUEST_6G, value),
     ),
     TPLinkRouterSwitchEntityDescription(
@@ -56,6 +60,7 @@ SWITCH_TYPES = (
         icon="mdi:wifi",
         entity_category=EntityCategory.CONFIG,
         property='wifi_2g_enable',
+        connection=Connection.HOST_2G,
         method=lambda coordinator, value: coordinator.set_wifi(Connection.HOST_2G, value),
     ),
     TPLinkRouterSwitchEntityDescription(
@@ -64,6 +69,7 @@ SWITCH_TYPES = (
         icon="mdi:wifi",
         entity_category=EntityCategory.CONFIG,
         property='wifi_5g_enable',
+        connection=Connection.HOST_5G,
         method=lambda coordinator, value: coordinator.set_wifi(Connection.HOST_5G, value),
     ),
     TPLinkRouterSwitchEntityDescription(
@@ -72,6 +78,7 @@ SWITCH_TYPES = (
         icon="mdi:wifi",
         entity_category=EntityCategory.CONFIG,
         property='wifi_6g_enable',
+        connection=Connection.HOST_6G,
         method=lambda coordinator, value: coordinator.set_wifi(Connection.HOST_6G, value),
     ),
     TPLinkRouterSwitchEntityDescription(
@@ -80,6 +87,7 @@ SWITCH_TYPES = (
         icon="mdi:wifi",
         entity_category=EntityCategory.CONFIG,
         property='iot_2g_enable',
+        connection=Connection.IOT_2G,
         method=lambda coordinator, value: coordinator.set_wifi(Connection.IOT_2G, value),
     ),
     TPLinkRouterSwitchEntityDescription(
@@ -88,6 +96,7 @@ SWITCH_TYPES = (
         icon="mdi:wifi",
         entity_category=EntityCategory.CONFIG,
         property='iot_5g_enable',
+        connection=Connection.IOT_5G,
         method=lambda coordinator, value: coordinator.set_wifi(Connection.IOT_5G, value),
     ),
     TPLinkRouterSwitchEntityDescription(
@@ -96,6 +105,7 @@ SWITCH_TYPES = (
         icon="mdi:wifi",
         entity_category=EntityCategory.CONFIG,
         property='iot_6g_enable',
+        connection=Connection.IOT_6G,
         method=lambda coordinator, value: coordinator.set_wifi(Connection.IOT_6G, value),
     ),
 )
@@ -142,6 +152,9 @@ class TPLinkRouterSwitchEntity(
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
+        connection = self.entity_description.connection
+        if connection and not self.coordinator.is_wifi_writable(connection):
+            return False
         return getattr(self.coordinator.status, self.entity_description.property) is not None
 
     async def async_turn_on(self, **kwargs: Any) -> None:

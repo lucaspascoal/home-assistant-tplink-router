@@ -4,6 +4,7 @@ from datetime import timedelta, datetime
 from logging import Logger
 from collections.abc import Callable
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.exceptions import HomeAssistantError
 from tplinkrouterc6u import (
     TplinkRouterProvider,
     AbstractRouter,
@@ -38,6 +39,7 @@ class TPLinkRouterCoordinator(DataUpdateCoordinator):
         self.status = status
         self.tracked = {}
         self.lte_status = lte_status
+        self._wifi_write_supported: dict[Connection, bool] = {}
         self.device_info = DeviceInfo(
             configuration_url=router.host,
             connections={(CONNECTION_NETWORK_MAC, self.status.lan_macaddr)},
@@ -87,8 +89,42 @@ class TPLinkRouterCoordinator(DataUpdateCoordinator):
             self.router.set_wifi(wifi, enable)
             return self.router.get_status()
 
-        self.status = await self.hass.async_add_executor_job(TPLinkRouterCoordinator.request, self.router, callback)
-        self.async_set_updated_data(self.status)
+        try:
+            self.status = await self.hass.async_add_executor_job(
+                TPLinkRouterCoordinator.request,
+                self.router,
+                callback,
+            )
+            self._wifi_write_supported[wifi] = True
+            self.async_set_updated_data(self.status)
+        except Exception as err:
+            if TPLinkRouterCoordinator._is_deco_app_only_write_error(err):
+                for conn in TPLinkRouterCoordinator._expand_related_connections(wifi):
+                    self._wifi_write_supported[conn] = False
+                self.async_set_updated_data(self.status)
+                raise HomeAssistantError(
+                    "This Deco firmware does not allow changing this Wi-Fi setting via local web API. "
+                    "Use the Deco app for this action."
+                ) from err
+            raise
+
+    def is_wifi_writable(self, wifi: Connection) -> bool:
+        return self._wifi_write_supported.get(wifi, True)
+
+    @staticmethod
+    def _expand_related_connections(wifi: Connection) -> list[Connection]:
+        if wifi in [Connection.GUEST_2G, Connection.GUEST_5G, Connection.GUEST_6G]:
+            return [Connection.GUEST_2G, Connection.GUEST_5G, Connection.GUEST_6G]
+        if wifi in [Connection.HOST_2G, Connection.HOST_5G, Connection.HOST_6G]:
+            return [Connection.HOST_2G, Connection.HOST_5G, Connection.HOST_6G]
+        if wifi in [Connection.IOT_2G, Connection.IOT_5G, Connection.IOT_6G]:
+            return [Connection.IOT_2G, Connection.IOT_5G, Connection.IOT_6G]
+        return [wifi]
+
+    @staticmethod
+    def _is_deco_app_only_write_error(err: Exception) -> bool:
+        text = str(err)
+        return "WLAN write was sent but no state change was observed" in text
 
     async def _async_update_data(self):
         """Asynchronous update of all data."""
