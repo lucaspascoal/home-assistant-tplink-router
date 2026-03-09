@@ -283,6 +283,7 @@ def _build_wlan_retry_payloads(
         # Candidate 5: full guest objects from read-state, preserving other guest fields.
         if isinstance(state, dict):
             params_from_state: dict[str, Any] = {}
+            params_full_state: dict[str, Any] = {}
             for band in guest_bands:
                 band_cfg = state.get(band)
                 if not isinstance(band_cfg, dict):
@@ -290,9 +291,25 @@ def _build_wlan_retry_payloads(
                 guest_cfg = band_cfg.get("guest")
                 if not isinstance(guest_cfg, dict):
                     continue
+
                 new_guest_cfg = dict(guest_cfg)
                 new_guest_cfg["enable"] = desired
                 params_from_state[band] = {"guest": new_guest_cfg}
+
+                # Some Deco firmwares expect host fields in the same write call.
+                full_band_cfg: dict[str, Any] = {"guest": new_guest_cfg}
+                host_cfg = band_cfg.get("host")
+                if isinstance(host_cfg, dict):
+                    full_band_cfg["host"] = dict(host_cfg)
+                iot_cfg = band_cfg.get("iot")
+                if isinstance(iot_cfg, dict):
+                    full_band_cfg["iot"] = dict(iot_cfg)
+                params_full_state[band] = full_band_cfg
+
+            # Preserve root keys that may be required by vendor handlers.
+            for key in ("enable_2g", "enable_5g", "enable_5g2", "enable_6g", "enable_6g2", "host_isolation"):
+                if key in state:
+                    params_full_state[key] = state[key]
 
             if params_from_state:
                 candidates.append({"operation": "write", "params": params_from_state})
@@ -300,8 +317,24 @@ def _build_wlan_retry_payloads(
                     "operation": "write",
                     "params": _transform_enable_values(params_from_state, lambda b: "on" if b else "off"),
                 })
+                candidates.append({
+                    "operation": "write",
+                    "params": _transform_enable_values(params_from_state, lambda b: 1 if b else 0),
+                })
 
-            # Candidate 6+: if read-state has root guest controls, try those.
+            # Candidate 6: full per-band objects from read-state (host+guest+iot).
+            if params_full_state:
+                candidates.append({"operation": "write", "params": params_full_state})
+                candidates.append({
+                    "operation": "write",
+                    "params": _transform_enable_values(params_full_state, lambda b: "on" if b else "off"),
+                })
+                candidates.append({
+                    "operation": "write",
+                    "params": _transform_enable_values(params_full_state, lambda b: 1 if b else 0),
+                })
+
+            # Candidate 7+: if read-state has root guest controls, try those.
             for key, value in state.items():
                 if not isinstance(value, dict):
                     continue
