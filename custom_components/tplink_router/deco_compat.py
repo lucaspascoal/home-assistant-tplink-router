@@ -214,26 +214,35 @@ def _build_wlan_retry_requests(
 ) -> list[tuple[str, str]]:
     requests: list[tuple[str, str]] = []
 
-    for payload in _build_wlan_retry_payloads(original_payload, state, targets, logger):
-        requests.append((path, payload))
-
     if _guest_only_targets(targets):
-        for endpoint in _guest_retry_endpoints(path):
-            for params in _build_guest_retry_param_sets(state, targets):
-                for params_variant in _build_enable_value_variants(params):
-                    requests.append((
-                        endpoint,
-                        dumps({"operation": "write", "params": params_variant}),
-                    ))
+        # Prefer guest-specific endpoint/payload shapes first for Deco firmwares
+        # that reject generic WLAN band objects on write.
+        params_candidates: list[dict[str, Any]] = []
+        params_candidates.extend(_build_guest_minimal_param_sets(state, targets))
+        params_candidates.extend(_build_guest_retry_param_sets(state, targets))
 
         params_from_full_state = _apply_targets_to_state(state, targets)
         if params_from_full_state:
+            params_candidates.append(params_from_full_state)
+
+        guest_payloads: list[str] = []
+        guest_payloads_seen: set[str] = set()
+        for params in params_candidates:
+            for params_variant in _build_enable_value_variants(params):
+                payload = dumps({"operation": "write", "params": params_variant})
+                if payload in guest_payloads_seen:
+                    continue
+                guest_payloads_seen.add(payload)
+                guest_payloads.append(payload)
+
+        # Round-robin payloads across guest endpoints so retry trimming does not
+        # starve secondary endpoints.
+        for payload in guest_payloads:
             for endpoint in _guest_retry_endpoints(path):
-                for params_variant in _build_enable_value_variants(params_from_full_state):
-                    requests.append((
-                        endpoint,
-                        dumps({"operation": "write", "params": params_variant}),
-                    ))
+                requests.append((endpoint, payload))
+
+    for payload in _build_wlan_retry_payloads(original_payload, state, targets, logger):
+        requests.append((path, payload))
 
     unique_requests: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -310,6 +319,69 @@ def _build_guest_retry_param_sets(
                 "guestNetwork": dict(guest_profile_copy),
                 "ext_guest": dict(ext_guest_profile),
             })
+
+    return params_sets
+
+
+def _build_guest_minimal_param_sets(
+    state: dict | None,
+    targets: list[tuple[tuple[str, str, str], bool]],
+) -> list[dict[str, Any]]:
+    if not targets:
+        return []
+
+    all_same_desired = len({desired for _, desired in targets}) == 1
+    desired = targets[0][1] if all_same_desired else None
+    band_to_enable_key = {
+        "band2_4": "enable_2g",
+        "band5_1": "enable_5g",
+        "band5_2": "enable_5g2",
+        "band6": "enable_6g",
+        "band6_2": "enable_6g2",
+    }
+
+    per_band_enable: dict[str, Any] = {}
+    if isinstance(state, dict):
+        for band, enable_key in band_to_enable_key.items():
+            current = _get_nested(state, [band, "guest", "enable"])
+            if current is not None:
+                per_band_enable[enable_key] = _to_bool(current)
+
+    for path, value in targets:
+        band = path[0]
+        enable_key = band_to_enable_key.get(band)
+        if enable_key:
+            per_band_enable[enable_key] = value
+
+    # Deco guest UI often uses a unified 2.4/5G switch.
+    if desired is not None and any(path[0] in ("band2_4", "band5_1") for path, _ in targets):
+        per_band_enable["enable_2g"] = desired
+        per_band_enable["enable_5g"] = desired
+
+    minimal_profiles: list[dict[str, Any]] = []
+    if desired is not None:
+        minimal_profiles.append({"enable": desired})
+
+    profile_2g5g: dict[str, Any] = {}
+    for key in ("enable_2g", "enable_5g"):
+        if key in per_band_enable:
+            profile_2g5g[key] = per_band_enable[key]
+    if desired is not None:
+        profile_2g5g["enable"] = desired
+    if profile_2g5g:
+        minimal_profiles.append(profile_2g5g)
+
+    if per_band_enable:
+        full_enable_profile = dict(per_band_enable)
+        if desired is not None:
+            full_enable_profile["enable"] = desired
+        minimal_profiles.append(full_enable_profile)
+
+    params_sets: list[dict[str, Any]] = []
+    for profile in minimal_profiles:
+        params_sets.append({"guest": dict(profile)})
+        params_sets.append({"guest_network": dict(profile)})
+        params_sets.append({"guestNetwork": dict(profile)})
 
     return params_sets
 
@@ -734,25 +806,10 @@ def _build_legacy_guest_profile(
         "enable",
         "enable_2g",
         "enable_5g",
-        "ssid",
-        "password",
-        "enable_wpa3",
-        "encryption",
-        "encryption_mode",
-        "enc_type",
-        "host_isolation",
-        "bw_limit_enable",
-        "bandwidth_limit",
-        "bw_limit_down",
-        "bw_limit_up",
-        "downstream_bandwidth",
-        "upstream_bandwidth",
-        "vlan_enable",
-        "vlan_id",
-        "need_set_vlan",
-        "access_duration",
-        "start_time",
-        "usr_set",
+        "enable_5g2",
+        "enable_6g",
+        "enable_6g2",
+        "guest_enable_6g2",
     ):
         if key in guest_profile:
             profile[key] = guest_profile[key]
