@@ -152,9 +152,6 @@ class TPLinkRouterSwitchEntity(
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        connection = self.entity_description.connection
-        if connection and not self.coordinator.is_wifi_writable(connection):
-            return False
         return getattr(self.coordinator.status, self.entity_description.property) is not None
 
     async def async_turn_on(self, **kwargs: Any) -> None:

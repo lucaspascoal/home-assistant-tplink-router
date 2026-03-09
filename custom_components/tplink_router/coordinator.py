@@ -1,5 +1,6 @@
 from __future__ import annotations
 import hashlib
+from threading import Lock
 from datetime import timedelta, datetime
 from logging import Logger
 from collections.abc import Callable
@@ -71,15 +72,23 @@ class TPLinkRouterCoordinator(DataUpdateCoordinator):
 
     @staticmethod
     def request(router: AbstractRouter, callback: Callable):
-        router.authorize()
-        try:
-            return callback()
-        finally:
+        # The underlying client is stateful (_logged/_stok/sysauth).
+        # Serialize access to avoid authorize/logout races across executor threads.
+        lock = getattr(router, "_ha_request_lock", None)
+        if lock is None:
+            lock = Lock()
+            setattr(router, "_ha_request_lock", lock)
+
+        with lock:
+            router.authorize()
             try:
-                router.logout()
-            except Exception:
-                # Do not block updates if logout fails.
-                pass
+                return callback()
+            finally:
+                try:
+                    router.logout()
+                except Exception:
+                    # Do not block updates if logout fails.
+                    pass
 
     async def reboot(self) -> None:
         await self.hass.async_add_executor_job(TPLinkRouterCoordinator.request, self.router, self.router.reboot)
@@ -98,6 +107,17 @@ class TPLinkRouterCoordinator(DataUpdateCoordinator):
             self._wifi_write_supported[wifi] = True
             self.async_set_updated_data(self.status)
         except Exception as err:
+            # Keep coordinator state fresh even if write fails.
+            try:
+                self.status = await self.hass.async_add_executor_job(
+                    TPLinkRouterCoordinator.request,
+                    self.router,
+                    self.router.get_status,
+                )
+                self.async_set_updated_data(self.status)
+            except Exception:
+                pass
+
             if TPLinkRouterCoordinator._is_deco_app_only_write_error(err):
                 for conn in TPLinkRouterCoordinator._expand_related_connections(wifi):
                     self._wifi_write_supported[conn] = False
@@ -124,7 +144,14 @@ class TPLinkRouterCoordinator(DataUpdateCoordinator):
     @staticmethod
     def _is_deco_app_only_write_error(err: Exception) -> bool:
         text = str(err)
-        return "WLAN write was sent but no state change was observed" in text
+        # "No state change observed" is not enough to classify a firmware as app-only:
+        # it can also happen on transient parse/session issues.
+        app_only_markers = (
+            "This operation is not allowed for remote management",
+            "operation not permitted by local web API",
+            "WLAN write blocked by firmware policy",
+        )
+        return any(marker in text for marker in app_only_markers)
 
     async def _async_update_data(self):
         """Asynchronous update of all data."""
