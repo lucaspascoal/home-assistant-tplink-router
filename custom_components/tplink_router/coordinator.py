@@ -126,6 +126,12 @@ class TPLinkRouterCoordinator(DataUpdateCoordinator):
                     "This Deco firmware does not allow changing this Wi-Fi setting via local web API. "
                     "Use the Deco app for this action."
                 ) from err
+            if TPLinkRouterCoordinator._is_deco_no_state_change_error(err):
+                # Surface a controlled service error instead of an unexpected traceback.
+                raise HomeAssistantError(
+                    "Deco did not apply this Wi-Fi change via local API on the current firmware. "
+                    "The current router state was refreshed."
+                ) from err
             raise
 
     def is_wifi_writable(self, wifi: Connection) -> bool:
@@ -152,6 +158,11 @@ class TPLinkRouterCoordinator(DataUpdateCoordinator):
             "WLAN write blocked by firmware policy",
         )
         return any(marker in text for marker in app_only_markers)
+
+    @staticmethod
+    def _is_deco_no_state_change_error(err: Exception) -> bool:
+        text = str(err)
+        return "WLAN write was sent but no state change was observed" in text
 
     async def _async_update_data(self):
         """Asynchronous update of all data."""
