@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - fix/deco-wifi-verification
 jobs:
   pytest:
     runs-on: ubuntu-latest
