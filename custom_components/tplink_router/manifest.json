@@ -9,7 +9,8 @@
     "iot_class": "local_polling",
     "issue_tracker": "https://github.com/AlexandrErohin/home-assistant-tplink-router/issues",
     "requirements": [
-        "tplinkrouterc6u[deco-tmp]@git+https://github.com/lucaspascoal/TP-Link-Archer-C6U.git@10ffd1de61f9f36499d3ee0cfa2435aea33651db"
+        "tplinkrouterc6u@git+https://github.com/lucaspascoal/TP-Link-Archer-C6U.git@10ffd1de61f9f36499d3ee0cfa2435aea33651db",
+        "paramiko==3.5.0"
     ],
-    "version": "2.48.1.dev2"
+    "version": "2.48.1.dev3"
 }

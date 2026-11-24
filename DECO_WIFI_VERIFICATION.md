@@ -16,7 +16,9 @@ Both app fields are optional. Missing or unsupported partial configuration is re
 
 ## Development installation
 
-The manifest and test requirements pin the companion library, including its optional `deco-tmp` dependency group, to commit `10ffd1de61f9f36499d3ee0cfa2435aea33651db`. The two files reference the same immutable revision for reproducible installation and testing.
+The manifest and test requirements pin the companion library to commit `10ffd1de61f9f36499d3ee0cfa2435aea33651db`. The two files reference the same immutable revision for reproducible installation and testing.
+
+Home Assistant pins the SSH dependency separately to `paramiko==3.5.0` for compatibility with integrations sharing its runtime. The standalone library retains its optional `deco-tmp` dependency group.
 
 HACS is configured to allow repository archive downloads rather than requiring a release ZIP. Select the development revision containing this change. Installing the older default branch does not install the verified control path. Back up the existing custom integration and retain its configuration entry when replacing its files.
 
